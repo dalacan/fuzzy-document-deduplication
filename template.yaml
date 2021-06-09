@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Fuzzy document deduplicator
+
+  SAM Template for Fuzzy document deduplicator
+
+Resources:
+  SrcBucket:
+    Type: AWS::S3::Bucket
+  DestBucket:
+    Type: AWS::S3::Bucket
+  AnalyzedBucket:
+    Type: AWS::S3::Bucket
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    
+  TextractSnsTopic:
+    Type: AWS::SNS::Topic
+    
+  TextractSnsRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "textract.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonTextractServiceRole"
+        
+  ComprehendRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "comprehend.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+
+  ComprehendRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ComprehendRolePolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${AWS::StackName}*"
+      Roles:
+        - !Ref ComprehendRole
+    
+  ProcessDocumentFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: process_document/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+      Policies:
+        - TextractDetectAnalyzePolicy: {}
+        - TextractGetResultPolicy: {}
+        - S3WritePolicy:
+            BucketName: !Ref DestBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}*"
+            - Effect: Allow
+              Action:
+                - 'sqs:*'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'sns:*'
+              Resource: '*'
+      Environment:
+        Variables:
+          DESTBUCKET: !Ref DestBucket
+          SNSTopicArn: !Ref TextractSnsTopic
+          SNSTopicRoleArn: !GetAtt TextractSnsRole.Arn
+      Events:
+        DocumentCreateEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref SrcBucket
+            Events: s3:ObjectCreated:*
+            
+  AnalyzeDocumentFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: analyze_document/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+      Policies:
+        - ComprehendBasicAccessPolicy: {}
+        - S3ReadPolicy:
+            BucketName: !Ref DestBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}*"
+            - Effect: Allow
+              Action:
+                - 'iam:PassRole'
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - 'comprehend:StartTopicsDetectionJob'
+                - 'comprehend:DescribeTopicsDetectionJob'
+                - 'comprehend:ListTopicsDetectionJobs'
+              Resource: '*'
+      Environment:
+        Variables:
+          INPUTBUCKET: !Ref DestBucket
+          OUTPUTBUCKET: !Ref AnalyzedBucket
+          ComprehendRoleArn: !GetAtt ComprehendRole.Arn
+  
+  DeduplicateDocumentFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: deduplicate_document/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Timeout: 600
+      MemorySize: 4096
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DestBucket
+        - S3ReadPolicy:
+            BucketName: !Ref AnalyzedBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}*"
+      Environment:
+        Variables:
+          INPUTBUCKET: !Ref DestBucket
+          OUTPUTBUCKET: !Ref AnalyzedBucket
+          ModelBucket: !Ref ModelBucket
+          ModelFile: 'model.bin'
+
+Outputs:
+  ProcessDocumentFunction:
+    Description: "ProcessDocumentFunction Lambda Function ARN"
+    Value: !GetAtt ProcessDocumentFunction.Arn
+  SourceBucket:
+    Description: "Source Bucket"
+    Value: !Ref SrcBucket
+  DestinationBucket:
+    Description: "Destination Bucket"
+    Value: !Ref DestBucket
